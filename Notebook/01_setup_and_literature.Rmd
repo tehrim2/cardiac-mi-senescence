@@ -1,0 +1,176 @@
+---
+title: "Senescence-Driven Cardiac Fibrosis After MI — Gene Therapy Target Discovery"
+subtitle: "Day 1: Setup, Data Acquisition, and Literature Notes"
+author: "Tehrim [Your Last Name]"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Project Question
+
+**Working hypothesis:** Cardiac fibroblast senescence after myocardial infarction (MI)
+is beneficial when transient (limits over-fibrosis, days ~3-7 post-MI) but becomes
+pathological when persistent (drives chronic SASP-mediated fibrosis). The molecular
+switch-point between these two states is poorly defined and is the gap this project
+targets — with an eye toward identifying transcriptional drivers that could be
+AAV/siRNA gene-therapy targets to "lock in" the reparative state and prevent the
+pathological one.
+
+**Dataset:** Kuppe et al. 2022, *Nature* — spatial multi-omic map of human MI
+(single-cell RNA-seq + spatial transcriptomics across injury zones and controls).
+DOI: 10.1038/s41586-022-05060-x
+
+---
+
+# 2. Literature Notes
+
+*Fill this in as you read today — this section becomes your Introduction later.*
+
+## Hernández et al., Sci Data 2026 — Reparative Cardiac Fibroblasts (RCFs)
+- Key claim:
+- Relevance to my question:
+- Any gene markers they report for the reparative state:
+
+## Frontiers Immunol. 2026 — SASP-mediated senescence post-MI (review)
+- Key claim:
+- Relevance to my question:
+
+## biorxiv Aug 2025 — p16 reporter mouse, multi-omic senescence MI
+- Key claim:
+- Relevance to my question:
+- Any gene markers/timepoints they report:
+
+## Kuppe et al. 2022, Nature — dataset paper
+- Fibroblast states they define:
+- Spatial zones in the data (ischemic / border / remote / control):
+- Anything about senescence or SASP genes already flagged:
+
+---
+
+# 3. Environment Setup
+
+This project uses `renv` for reproducibility — this is what makes the notebook
+shareable and rerunnable by anyone (including a PI reviewing your GitHub).
+
+```{r renv-init, eval=FALSE}
+# Run this once, in the R console (not inside the notebook), from your project folder:
+# install.packages("renv")
+# renv::init()
+```
+
+```{r install-packages, eval=FALSE}
+# Core single-cell workflow
+install.packages(c("Seurat", "tidyverse", "patchwork", "Matrix"))
+
+# Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c(
+  "zellkonverter",   # reads .h5ad (AnnData) files into SingleCellExperiment
+  "SingleCellExperiment",
+  "DESeq2",
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "AUCell",          # senescence/SASP gene set scoring
+  "slingshot"        # trajectory analysis
+)
+
+# Batch correction
+install.packages("harmony")
+
+# Gene set database
+install.packages("msigdbr")
+
+# Cell-cell communication (Day 5, optional)
+# devtools::install_github("jinworks/CellChat")
+```
+
+```{r load-libraries}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(harmony)
+```
+
+---
+
+# 4. Data Acquisition
+
+The Kuppe et al. 2022 data is distributed as an `.h5ad` (AnnData/Python format).
+We need to convert it to a Seurat object.
+
+**Manual download step (do this outside R):**
+
+1. Go to the CZ CELLxGENE Discover collection page for "Spatial multi-omic map of
+   human myocardial infarction" (search the title at cellxgene.cziscience.com).
+2. Download the single-cell RNA-seq `.h5ad` file (not the spatial one, for now —
+   we start with the scRNA-seq to keep Day 1-4 manageable).
+3. Save it into `data/raw/kuppe_2022_scRNA.h5ad` in your project folder.
+
+```{r convert-h5ad, eval=FALSE}
+# Convert .h5ad -> SingleCellExperiment -> Seurat
+sce <- readH5AD("data/raw/kuppe_2022_scRNA.h5ad")
+seurat_obj <- as.Seurat(sce, counts = "X", data = NULL)
+
+# Quick sanity check
+seurat_obj
+dim(seurat_obj)
+head(seurat_obj@meta.data)
+
+# Save so you don't have to reconvert every time
+saveRDS(seurat_obj, "data/processed/kuppe_seurat_raw.rds")
+```
+
+---
+
+# 5. Project Repo Structure
+
+Create this folder structure in your project directory (same logic as a typical
+GitHub-shared bioinformatics repo — this is what a PI or collaborator expects
+to see):
+
+```
+cardiac-mi-senescence/
+├── data/
+│   ├── raw/            # original .h5ad (add to .gitignore — too large for GitHub)
+│   └── processed/       # saved .rds Seurat objects
+├── notebooks/
+│   ├── 01_setup_and_literature.Rmd    <- this file
+│   ├── 02_qc_preprocessing.Rmd
+│   ├── 03_clustering_annotation.Rmd
+│   ├── 04_differential_expression.Rmd
+│   └── 05_pathway_enrichment.Rmd
+├── results/
+│   ├── figures/
+│   └── tables/
+├── renv.lock            # auto-generated — locks exact package versions
+├── .gitignore
+└── README.md
+```
+
+`.gitignore` should contain at minimum:
+```
+data/raw/
+*.rds
+.Rproj.user/
+.Rhistory
+```
+
+---
+
+# 6. Session Info (reproducibility — always keep this at the end of every notebook)
+
+```{r session-info}
+sessionInfo()
+```
