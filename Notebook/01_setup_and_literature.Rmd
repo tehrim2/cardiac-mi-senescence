@@ -1,7 +1,6 @@
 ---
-title: "Senescence-Driven Cardiac Fibrosis After MI — Gene Therapy Target Discovery"
-subtitle: "Day 1: Setup, Data Acquisition, and Literature Notes"
-author: "Tehrim [Your Last Name]"
+title: "Senescence-Driven Cardiac Fibrosis After Myocardial Infarction — Target Discovery for Anti-Fibrotic Gene Therapy"
+author: "Tehrim Naveed"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -16,82 +15,96 @@ output:
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-# 1. Project Question
+# 1. Background and Question
 
-**Working hypothesis:** Cardiac fibroblast senescence after myocardial infarction (MI)
-is beneficial when transient (limits over-fibrosis, days ~3-7 post-MI) but becomes
-pathological when persistent (drives chronic SASP-mediated fibrosis). The molecular
-switch-point between these two states is poorly defined and is the gap this project
-targets — with an eye toward identifying transcriptional drivers that could be
-AAV/siRNA gene-therapy targets to "lock in" the reparative state and prevent the
-pathological one.
+Cardiac fibroblast senescence after myocardial infarction (MI) appears to be
+time-dependent: transient senescence in the first ~3-7 days post-MI limits
+excessive myofibroblast proliferation and helps prevent ventricular rupture,
+but if senescent fibroblasts persist, they drive chronic SASP-mediated
+fibrosis and impair long-term cardiac function. The transcriptional switch
+between these two states, reparative and transient versus persistent and
+pathological, is not well defined at single-cell resolution in human tissue.
 
-**Dataset:** Kuppe et al. 2022, *Nature* — spatial multi-omic map of human MI
-(single-cell RNA-seq + spatial transcriptomics across injury zones and controls).
-DOI: 10.1038/s41586-022-05060-x
+**Question:** What distinguishes the transcriptional program of transiently
+senescent, reparative cardiac fibroblasts from persistently senescent,
+SASP-high fibroblasts after MI, and which of the genes driving that
+divergence are plausible targets for AAV- or siRNA-based anti-fibrotic gene
+therapy?
+
+**Dataset:** Kuppe et al. 2022, *Nature* (DOI: 10.1038/s41586-022-05060-x) —
+single-nucleus RNA-seq, snATAC-seq, and spatial transcriptomics (Visium)
+across ischemic, border, remote, and control zones of human MI tissue. This
+analysis uses the snRNA-seq component (191,795 nuclei, n = 23 samples).
 
 ---
 
-# 2. Literature Notes
+# 2. Literature Review
 
-*Fill this in as you read today — this section becomes your Introduction later.*
+## Hernández et al., *Scientific Data* 2026
+Defines a Reparative Cardiac Fibroblast (RCF) subpopulation responsible for
+orchestrating scar formation and preventing ventricular rupture post-MI.
+Combines bulk RNA-seq, RNAscope, and spatial transcriptomics to map the
+early transcriptional transition into the RCF state. Notably, the timing of
+RCF appearance and the specific molecular events driving the transition are
+described as still undefined, this is the most direct precedent for the
+gap this project addresses, and I'll use it to cross-check any early
+reparative markers recovered from the Kuppe fibroblast clusters.
 
-## Hernández et al., Sci Data 2026 — Reparative Cardiac Fibroblasts (RCFs)
-- Key claim:
-- Relevance to my question:
-- Any gene markers they report for the reparative state:
+## Frontiers in Immunology 2026 — SASP-mediated senescence post-MI (review)
+Synthesizes the current model: fibroblast proliferation peaks around day 7
+post-MI, and transient, controlled senescence at this stage limits excessive
+scarring. Under persistent inflammatory/pro-fibrotic signaling, senescence
+shifts from reparative regulation to pathological amplification via
+long-term SASP secretion. Provides a working list of senescence/SASP
+therapeutic strategies (senolytics, senostatics) to compare against
+gene-therapy framing.
 
-## Frontiers Immunol. 2026 — SASP-mediated senescence post-MI (review)
-- Key claim:
-- Relevance to my question:
+## Cardiac fibroblast senescence dynamics — bioRxiv, Aug 2025
+Multi-omic (spatial + single-nucleus) profiling in a p16 (Cdkn2a) senescence-
+reporter mouse model, day 7 post-MI. Fibroblasts account for the majority
+(~58%) of p16-high senescent cells across all cardiac cell types. Senescent
+cell burden is shown to be transient, most p16-high cells revert to a
+non-senescent state over the following weeks, supporting a dynamic rather
+than fixed senescent state. Strongest mechanistic precedent so far for
+treating senescence as a reversible, time-resolved process rather than a
+binary label.
 
-## biorxiv Aug 2025 — p16 reporter mouse, multi-omic senescence MI
-- Key claim:
-- Relevance to my question:
-- Any gene markers/timepoints they report:
-
-## Kuppe et al. 2022, Nature — dataset paper
-- Fibroblast states they define:
-- Spatial zones in the data (ischemic / border / remote / control):
-- Anything about senescence or SASP genes already flagged:
+## Kuppe et al. 2022, *Nature* — primary dataset
+Defines fibroblast-to-myofibroblast differentiation trajectories across
+injury zones and validates disease-specific cardiac cell states in their
+spatial context. Fibrotic zone (FZ) and ischemic zone (IZ) samples are the
+most relevant for capturing late/persistent fibrotic states; border zone
+(BZ) and remote zone (RZ) samples should capture earlier or less-affected
+transcriptional states. No explicit senescence/SASP scoring is reported in
+the original paper, this is the gap this reanalysis is positioned to fill.
 
 ---
 
 # 3. Environment Setup
 
-This project uses `renv` for reproducibility — this is what makes the notebook
-shareable and rerunnable by anyone (including a PI reviewing your GitHub).
-
 ```{r renv-init, eval=FALSE}
-# Run this once, in the R console (not inside the notebook), from your project folder:
+# Run once from the console, from the project root
 # install.packages("renv")
 # renv::init()
 ```
 
 ```{r install-packages, eval=FALSE}
-# Core single-cell workflow
 install.packages(c("Seurat", "tidyverse", "patchwork", "Matrix"))
 
-# Bioconductor packages
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 BiocManager::install(c(
-  "zellkonverter",   # reads .h5ad (AnnData) files into SingleCellExperiment
+  "zellkonverter",
   "SingleCellExperiment",
   "DESeq2",
   "clusterProfiler",
   "org.Hs.eg.db",
-  "AUCell",          # senescence/SASP gene set scoring
-  "slingshot"        # trajectory analysis
-)
+  "AUCell",
+  "slingshot"
+))
 
-# Batch correction
 install.packages("harmony")
-
-# Gene set database
 install.packages("msigdbr")
-
-# Cell-cell communication (Day 5, optional)
-# devtools::install_github("jinworks/CellChat")
+# devtools::install_github("jinworks/CellChat")  # Day 5
 ```
 
 ```{r load-libraries}
@@ -107,46 +120,32 @@ library(harmony)
 
 # 4. Data Acquisition
 
-The Kuppe et al. 2022 data is distributed as an `.h5ad` (AnnData/Python format).
-We need to convert it to a Seurat object.
-
-**Manual download step (do this outside R):**
-
-1. Go to the CZ CELLxGENE Discover collection page for "Spatial multi-omic map of
-   human myocardial infarction" (search the title at cellxgene.cziscience.com).
-2. Download the single-cell RNA-seq `.h5ad` file (not the spatial one, for now —
-   we start with the scRNA-seq to keep Day 1-4 manageable).
-3. Save it into `data/raw/kuppe_2022_scRNA.h5ad` in your project folder.
+snRNA-seq data (191,795 nuclei, all zones and controls) downloaded from CZ
+CELLxGENE Discover, Kuppe et al. 2022 collection, as `.h5ad`, converted to a
+Seurat object below.
 
 ```{r convert-h5ad, eval=FALSE}
-# Convert .h5ad -> SingleCellExperiment -> Seurat
 sce <- readH5AD("data/raw/kuppe_2022_scRNA.h5ad")
 seurat_obj <- as.Seurat(sce, counts = "X", data = NULL)
 
-# Quick sanity check
 seurat_obj
 dim(seurat_obj)
 head(seurat_obj@meta.data)
 
-# Save so you don't have to reconvert every time
 saveRDS(seurat_obj, "data/processed/kuppe_seurat_raw.rds")
 ```
 
 ---
 
-# 5. Project Repo Structure
-
-Create this folder structure in your project directory (same logic as a typical
-GitHub-shared bioinformatics repo — this is what a PI or collaborator expects
-to see):
+# 5. Repository Structure
 
 ```
 cardiac-mi-senescence/
 ├── data/
-│   ├── raw/            # original .h5ad (add to .gitignore — too large for GitHub)
-│   └── processed/       # saved .rds Seurat objects
+│   ├── raw/
+│   └── processed/
 ├── notebooks/
-│   ├── 01_setup_and_literature.Rmd    <- this file
+│   ├── 01_setup_and_literature.Rmd
 │   ├── 02_qc_preprocessing.Rmd
 │   ├── 03_clustering_annotation.Rmd
 │   ├── 04_differential_expression.Rmd
@@ -154,22 +153,14 @@ cardiac-mi-senescence/
 ├── results/
 │   ├── figures/
 │   └── tables/
-├── renv.lock            # auto-generated — locks exact package versions
+├── renv.lock
 ├── .gitignore
 └── README.md
 ```
 
-`.gitignore` should contain at minimum:
-```
-data/raw/
-*.rds
-.Rproj.user/
-.Rhistory
-```
-
 ---
 
-# 6. Session Info (reproducibility — always keep this at the end of every notebook)
+# 6. Session Info
 
 ```{r session-info}
 sessionInfo()
