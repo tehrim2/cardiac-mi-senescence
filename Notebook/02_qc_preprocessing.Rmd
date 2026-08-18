@@ -1,0 +1,168 @@
+---
+Title: "Senescence Driven Cardiac Fibrosis After Myocardial Infarction, Target Discovery for Anti Fibrotic Gene Therapy"
+subtitle: "Day 2: Quality Control and Fibroblast Subsetting"
+author: "Tehrim Naveed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
+# 1. Objective
+
+The snRNA seq object loaded on Day 1 (191,795 nuclei) already carries quality control metrics computed by the original authors (Kuppe et al. 2022), along with a mitochondrial percentage, a doublet score, a dissociation stress score, and per nucleus count and gene totals. The total nucleus count in the downloaded object matches the number reported in the original publication, indicating the authors' own filtering has already been applied upstream.
+
+The purpose of this notebook is to inspect these metrics directly rather
+than assume their meaning, apply one additional, explicitly documented
+filtering step for reproducibility, and isolate the fibroblast population
+that this project focuses on.
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+library(Seurat)
+library(tidyverse)
+
+seurat_obj <- readRDS("data/processed/kuppe_seurat_raw.rds")
+dim(seurat_obj)
+```
+
+---
+
+# 3. Inspecting Quality Control Metrics
+
+```{r qc-summary}
+summary(seurat_obj@meta.data$percent_mito)
+summary(seurat_obj@meta.data$doublet_score)
+summary(seurat_obj@meta.data$dissociation_score)
+summary(seurat_obj@meta.data$n_counts)
+summary(seurat_obj@meta.data$n_genes)
+```
+
+The percent_mito maximum sits at 4.995, and the n_counts and n_genes minimums sit close to round numbers (501 and 306 respectively). This is expected for single nucleus data, where mitochondrial RNA content is naturally very low compared to whole cell data.
+
+```{r qc-violin, fig.width=9, fig.height=7}
+VlnPlot(
+  seurat_obj,
+  features = c("n_counts", "n_genes", "percent_mito", "doublet_score"),
+  group.by = "major_labl",
+  pt.size = 0,
+  ncol = 2
+)
+```
+
+The ischemic zone (IZ) shows visibly lower n_counts and n_genes distributions relative to the other four zones. This is consistent with the expected biology of actively injured tissue rather than a technical artifact, and is preserved rather than filtered out. percent_mito and doublet_score distributions are broadly comparable across all five zones.
+
+```{r qc-scatter, fig.width=7, fig.height=5}
+FeatureScatter(
+  seurat_obj,
+  feature1 = "n_counts",
+  feature2 = "percent_mito",
+  group.by = "major_labl"
+)
+```
+
+The relationship between total counts and mitochondrial percentage shows a
+single continuous distribution rather than two separated populations, which
+is expected signature of a distinct low quality subpopulation.
+This further supports that the dataset was already reasonably filtered
+before deposit.
+
+---
+
+# 4. Doublet Filtering Decision
+
+Unlike percent_mito, n_counts, and n_genes, the doublet_score distribution
+does not show an obvious pre applied ceiling. Since the exact doublet
+filtering threshold used in the original publication could not be
+confirmed, an explicit threshold is applied here for reproducibility rather
+than relying on an unverified upstream setting.
+
+```{r doublet-counts}
+sum(seurat_obj@meta.data$doublet_score > 0.2)
+sum(seurat_obj@meta.data$doublet_score > 0.3)
+sum(seurat_obj@meta.data$doublet_score > 0.5)
+nrow(seurat_obj@meta.data)
+```
+
+At a threshold of 0.3, 4,276 nuclei (approximately 2.2 percent of the total)
+exceed the cutoff. This threshold was selected as a moderate, documented
+choice for reproducibility, while avoiding an aggressive cutoff that risks discarding larger, transcriptionally active fibroblast or myofibroblast nuclei that are biologically relevant to this project.
+
+```{r doublet-filter}
+seurat_obj <- subset(
+  seurat_obj,
+  subset = doublet_score < 0.3
+)
+
+nrow(seurat_obj@meta.data)
+```
+
+187,519 nuclei remain after this filtering step.
+
+---
+
+# 5. Subsetting to Fibroblasts
+
+This project focuses specifically on the cardiac fibroblast lineage, as the
+research question concerns the transcriptional divergence between transient,
+reparative fibroblast senescence and persistent, pathological fibroblast
+senescence following myocardial infarction. Other cell types, including
+cardiomyocytes, endothelial cells, and vascular smooth muscle cells, are not
+the direct subject of this analysis, though they may be revisited later if
+cell to cell communication analysis is added.
+
+```{r subset-fibroblasts}
+fibroblasts <- subset(
+  seurat_obj,
+  subset = cell_type_original == "Fibroblast"
+)
+
+dim(fibroblasts)
+table(fibroblasts@meta.data$major_labl)
+```
+
+The fibroblast subset contains 46,453 nuclei across all five zones:
+
+| Zone | Nuclei |
+|------|--------|
+| BZ (border zone) | 6,299 |
+| CTRL (control) | 9,346 |
+| FZ (fibrotic zone) | 9,707 |
+| IZ (ischemic zone) | 9,970 |
+| RZ (remote zone) | 11,131 |
+
+All five zones retain a comparable number of fibroblasts, which supports
+proceeding with cross zone comparison in later steps without one condition
+being underpowered relative to the others.
+
+---
+
+# 6. Save Output
+
+```{r save-output}
+saveRDS(fibroblasts, "data/processed/kuppe_fibroblasts_qc.rds")
+```
+
+This file, containing 46,453 quality controlled fibroblast nuclei with
+metadata intact, is the starting point for Day 3 clustering and senescence
+scoring.
+
+---
+
+# 7. Session Info
+
+```{r session-info}
+sessionInfo()
+```
