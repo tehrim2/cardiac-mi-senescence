@@ -1,0 +1,399 @@
+---
+title: "Senescence Driven Cardiac Fibrosis After Myocardial Infarction, Target Discovery for Anti Fibrotic Gene Therapy"
+subtitle: "Day 3: Clustering, Ambient RNA Correction, Senescence Scoring, and Annotation"
+author: "Tehrim Naveed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
+```{r load-libraries}
+library(Seurat)
+library(tidyverse)
+library(harmony)
+library(SingleCellExperiment)
+library(zellkonverter)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(AUCell)
+library(celda)
+library(scDblFinder)
+```
+
+# 1. Objective
+
+Clustered and annotated the 46,453 fibroblast nuclei quality
+controlled in Day 2, corrected for ambient RNA contamination flagged as a
+known limitation in the original publication, called score for each fibroblast for senescence using two independent methods, identify what each resulting cluster represents using marker genes, and validate my cell population with an independent doublet detection pass.
+
+---
+
+# 2. Doublet Validation on the Full Dataset
+
+Since doublets are only reliably detectable when more than one cell type is
+present to simulate against, I ran doublet detection before subsetting to
+fibroblasts, on the full, all cell type object, using cell_type_original as
+the clustering variable and donor_id as the sample grouping variable so that
+detection respects real physical capture boundaries.
+
+```{r full-dataset-doublet-check, eval=FALSE}
+sce_full <- readH5AD("data/raw/kuppe_2022_scRNA.h5ad")
+counts_full <- assay(sce_full, "X")
+meta_full <- as.data.frame(colData(sce_full))
+rownames(meta_full) <- colnames(counts_full)
+rm(sce_full)
+gc()
+
+sce_input_full <- SingleCellExperiment(assays = list(counts = counts_full))
+
+sce_input_full <- scDblFinder(
+  sce_input_full,
+  clusters = meta_full$cell_type_original,
+  samples = meta_full$donor_id
+)
+
+meta_full$our_doublet_class <- sce_input_full$scDblFinder.class
+
+table(meta_full$our_doublet_class, meta_full$doublet_score < 0.3)
+```
+
+This identified 4,438 likely doublets across the full dataset, close to the
+4,276 cells flagged by the original authors' own scDblFinder run
+(doublet_score < 0.3), confirming that my independent run recovers a similar
+overall doublet rate to the published one. Individual cell level doublet
+calls between two independently run instances of this method are known to
+vary due to its reliance on randomized simulation, so rather than trust
+either run in isolation, I treated the intersection of both calls as a high
+confidence doublet set, and cells uniquely flagged by only one run as a
+lower confidence signal worth tracking rather than acting on directly.
+
+---
+
+# 3. Load Fibroblast Data
+
+```{r load-data}
+fibroblasts <- readRDS("data/processed/kuppe_fibroblasts_qc.rds")
+dim(fibroblasts)
+```
+
+This object already reflects the doublet_score < 0.3 filter applied in Day
+2, using the original authors' own scDblFinder output.
+
+---
+
+# 4. Normalization, Variable Features, and PCA
+
+```{r normalize-variable-features}
+fibroblasts <- NormalizeData(fibroblasts)
+fibroblasts <- FindVariableFeatures(fibroblasts, selection.method = "vst", nfeatures = 2000)
+```
+
+I used the vst method since it selects genes based on variance relative to
+expression level, preventing highly expressed genes from dominating
+selection purely due to scale. Among the top variable genes were SERPINE1,
+POSTN, and FN1, established markers of myofibroblast activity and the
+senescence associated secretory phenotype, an early signal that this
+fibroblast population carries the biology this project is built around.
+
+Two of the top ten variable genes, ENSG00000285861 and ENSG00000286922,
+mapped to long non coding RNAs currently annotated only as "novel
+transcript" with no established function, confirmed directly against the
+Ensembl REST API. I retained these in the analysis rather than excluding
+them, since their role is currently unknown rather than ruled out, and did
+not filter non coding genes from the variable feature set at any point.
+
+```{r scale-pca}
+fibroblasts <- ScaleData(fibroblasts, features = VariableFeatures(fibroblasts))
+fibroblasts <- RunPCA(fibroblasts, features = VariableFeatures(fibroblasts))
+
+ElbowPlot(fibroblasts, ndims = 30)
+```
+
+I selected fifteen principal components for downstream steps, based on the
+elbow plot flattening substantially by around PC10 to PC12.
+
+---
+
+# 5. Ambient RNA Correction
+
+Kuppe et al. 2022 report that necrotic tissue in the ischemic zone releases
+ambient RNA that can contaminate neighboring nuclei during capture, and flag
+this as a limitation in their own analysis that was not computationally
+corrected. Given this, I applied DecontX, which estimates and removes
+ambient contamination directly from the filtered count matrix, appropriate
+here since the raw, unfiltered droplet matrix needed for tools like SoupX or
+CellBender is not available through this dataset's public distribution.
+
+```{r initial-cluster-for-decontx}
+fibroblasts <- RunHarmony(
+  fibroblasts,
+  group.by.vars = "donor_id",
+  reduction.use = "pca",
+  dims.use = 1:15
+)
+
+fibroblasts <- FindNeighbors(fibroblasts, reduction = "harmony", dims = 1:15)
+fibroblasts <- FindClusters(fibroblasts, resolution = 0.5)
+```
+
+I used this initial clustering to inform DecontX's contamination model,
+which estimates each cell's deviation from its assigned cluster's expected
+expression profile.
+
+```{r run-decontx}
+counts_matrix <- GetAssayData(fibroblasts, layer = "counts")
+
+decontx_results <- decontX(counts_matrix, z = fibroblasts@meta.data$seurat_clusters)
+
+fibroblasts@meta.data$contamination <- decontx_results$contamination
+
+decontx_counts <- decontx_results$decontXcounts
+
+fibroblasts[["decontX"]] <- CreateAssay5Object(counts = decontx_counts)
+DefaultAssay(fibroblasts) <- "decontX"
+```
+
+I added the decontaminated counts as a separate assay rather than
+overwriting the original counts, keeping both available for comparison. By
+running DecontX before finalizing clusters, I address ambient contamination
+directly at the source, going a step further than the original publication,
+which flagged the issue but did not apply a computational correction.
+
+---
+
+# 6. Final Clustering
+
+```{r decontx-normalize-cluster}
+fibroblasts <- NormalizeData(fibroblasts)
+fibroblasts <- FindVariableFeatures(fibroblasts, selection.method = "vst", nfeatures = 2000)
+fibroblasts <- ScaleData(fibroblasts, features = VariableFeatures(fibroblasts))
+fibroblasts <- RunPCA(fibroblasts, features = VariableFeatures(fibroblasts))
+
+fibroblasts <- RunHarmony(
+  fibroblasts,
+  group.by.vars = "donor_id",
+  reduction.use = "pca",
+  dims.use = 1:15,
+  reduction.save = "harmony_decontx"
+)
+
+fibroblasts <- RunUMAP(fibroblasts, reduction = "harmony_decontx", dims = 1:15, reduction.name = "umap_decontx")
+fibroblasts <- FindNeighbors(fibroblasts, reduction = "harmony_decontx", dims = 1:15)
+fibroblasts <- FindClusters(fibroblasts, resolution = 0.5)
+
+DimPlot(fibroblasts, reduction = "umap_decontx", group.by = "seurat_clusters", label = TRUE)
+DimPlot(fibroblasts, reduction = "umap_decontx", group.by = "major_labl")
+```
+
+This produced nine clusters on the ambient RNA corrected data. The
+ischemic zone remained clearly separated from the other four zones even
+after this correction, indicating a genuine transcriptional difference in
+IZ fibroblasts, consistent with the necrosis associated stress response
+described in the original publication, rather than a technical artifact.
+
+---
+
+# 7. Senescence Scoring
+
+I scored senescence using the SenMayo gene set (Saul et al. 2022), pulled
+directly from MSigDB for reproducibility.
+
+```{r senmayo-retrieval}
+senmayo <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CGP") %>%
+  filter(gs_name == "SAUL_SEN_MAYO")
+
+senmayo_ids <- unique(na.omit(senmayo$ensembl_gene))
+senmayo_in_data <- senmayo_ids[senmayo_ids %in% rownames(fibroblasts)]
+
+length(senmayo_ids)
+length(senmayo_in_data)
+```
+
+124 of the 125 published SenMayo genes were available in MSigDB's current
+build, and 116 of those were present as measured features in this dataset.
+
+```{r addmodulescore}
+fibroblasts <- AddModuleScore(
+  fibroblasts,
+  features = list(senmayo_in_data),
+  name = "SenMayo"
+)
+```
+
+```{r aucell}
+expr_matrix <- GetAssayData(fibroblasts, layer = "counts")
+gene_sets <- list(SenMayo = senmayo_in_data)
+
+cell_rankings <- AUCell_buildRankings(expr_matrix, plotStats = TRUE)
+cell_auc <- AUCell_calcAUC(gene_sets, cell_rankings)
+
+fibroblasts@meta.data$SenMayo_AUCell <- as.numeric(getAUC(cell_auc)["SenMayo", ])
+```
+
+I scored senescence with two independent methods. AddModuleScore compares
+average expression against a matched control gene set, while AUCell ranks
+genes within each cell rather than comparing expression magnitude directly,
+making it less sensitive to depth differences between cells.
+
+```{r score-correlation}
+cor(fibroblasts@meta.data$SenMayo1, fibroblasts@meta.data$SenMayo_AUCell, method = "spearman")
+```
+
+I used Spearman correlation because the two scores sit on fundamentally
+different scales, AddModuleScore is zero centered and can be negative,
+AUCell is bounded between 0 and 1, so comparing relative ordering rather
+than raw magnitude is the appropriate test. The two methods showed a
+Spearman correlation of 0.87, strong agreement despite being built on
+independent statistical logic, which gives me confidence this senescence
+signal reflects real biology rather than an artifact of either method's
+assumptions.
+
+```{r score-visualization}
+VlnPlot(fibroblasts, features = c("SenMayo1", "SenMayo_AUCell"), group.by = "seurat_clusters", pt.size = 0)
+VlnPlot(fibroblasts, features = c("SenMayo1", "SenMayo_AUCell"), group.by = "major_labl", pt.size = 0)
+```
+
+Both scores were highest in clusters 1, 7, and 8, and highest overall in the
+IZ zone. I annotated each cluster by marker genes next, to establish which
+of these are genuine fibroblast populations before drawing conclusions from
+the scores.
+
+---
+
+# 8. Cluster Annotation
+
+```{r find-markers}
+markers <- FindAllMarkers(fibroblasts, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+top_markers$gene_symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = top_markers$gene,
+  keytype = "ENSEMBL",
+  column = "SYMBOL"
+)
+```
+
+Based on top marker genes, I identified the following cluster identities:
+
+Cluster 0, quiescent fibroblasts: ACSM1, ACSM3, ADH1B, FMO2, metabolic and
+detoxification genes consistent with homeostatic, baseline fibroblasts.
+
+Cluster 2, quiescent fibroblasts: SCARA5, PCOLCE2, established markers of
+resident cardiac fibroblasts.
+
+Cluster 4, activated myofibroblasts: MEOX1, THBS4, FAP, POSTN, TNC, LOXL1,
+the matrix producing, disease relevant fibroblast state central to this
+project.
+
+Cluster 5, acutely stressed fibroblasts: FOSB, NR4A1, PER2, immediate early
+genes, enriched in the fibrotic zone.
+
+Cluster 1, ischemic zone associated fibroblasts, elevated senescence score:
+this cluster carries a metabolic and stress associated marker profile
+consistent with fibroblast identity, and is the clearest senescence signal
+in a genuine fibroblast population in this dataset.
+
+```{r dotplot-verification}
+canonical_ids <- mapIds(
+  org.Hs.eg.db,
+  keys = c("PTPRC", "CD68", "MKI67", "COL1A1"),
+  keytype = "SYMBOL",
+  column = "ENSEMBL"
+)
+
+DotPlot(fibroblasts, features = canonical_ids, group.by = "seurat_clusters") + RotatedAxis()
+```
+
+Clusters 7 and 8, by contrast, expressed canonical macrophage markers
+(CD163, MSR1, STAB1, MERTK, PTPRC, CD68) and cell cycle genes (MKI67,
+FANCA, BRIP1, MELK, UHRF1) respectively, alongside detectable COL1A1,
+consistent with fibroblast-immune and fibroblast-proliferating cell
+doublets rather than pure fibroblast populations. I excluded both from
+downstream fibroblast specific analysis on this basis, standard practice
+when marker evidence contradicts an original cell type label.
+
+Cluster 3 shows some cardiomyocyte marker expression (TNNI3, MYL2, MYH7)
+alongside fibroblast genes, which I am carrying forward as a specific point
+to investigate further in Day 4, rather than excluding outright given the
+less clear cut evidence compared to clusters 7 and 8.
+
+```{r remove-clusters}
+fibroblasts_clean <- subset(
+  fibroblasts,
+  subset = seurat_clusters %in% c("7", "8"),
+  invert = TRUE
+)
+
+dim(fibroblasts_clean)
+table(fibroblasts_clean@meta.data$seurat_clusters, fibroblasts_clean@meta.data$major_labl)
+```
+
+This leaves 44,125 fibroblasts across clusters 0 through 6, forming the
+population I carry into Day 4.
+
+I also checked this cleaned population against the full dataset doublet
+detection results from Section 2. 533 fibroblasts (1.2 percent) were flagged
+by my independent run but not the original filter, mildly enriched in
+cluster 1 (2.6 percent versus 0.6 to 1.5 percent in other clusters). Given
+the known variability in individual doublet calls between independent runs
+described earlier, I did not remove these cells, and instead note this as
+context for interpreting cluster 1 specifically, alongside its comparatively
+lower sequencing depth.
+
+```{r additional-doublet-check, eval=FALSE}
+additional_doublets <- rownames(meta_full)[
+  meta_full$our_doublet_class == "doublet" & meta_full$doublet_score < 0.3
+]
+
+fibroblasts_clean@meta.data$additional_flag <- colnames(fibroblasts_clean) %in% additional_doublets
+
+table(fibroblasts_clean@meta.data$additional_flag, fibroblasts_clean@meta.data$seurat_clusters)
+```
+
+---
+
+# 9. Save Output
+
+```{r save-output}
+saveRDS(fibroblasts_clean, "data/processed/kuppe_fibroblasts_final.rds")
+```
+
+---
+
+# 10. Summary
+
+I corrected for ambient RNA contamination flagged in the original
+publication using DecontX, applied before finalizing clusters, which
+confirmed the ischemic zone's transcriptional distinctness reflects real
+biology rather than a technical artifact. I scored senescence using two
+independent methods with strong agreement (Spearman rho = 0.87), then used
+marker gene analysis to confirm cluster identities, which allowed me to
+exclude two clusters that were immune and proliferating cell populations
+rather than fibroblasts. The resulting population, cluster 1 specifically,
+represents a fibroblast population with a genuine, corroborated senescence
+signal, interpreted alongside its comparatively lower sequencing depth and
+a modest doublet enrichment flagged by independent validation. Cluster 3's
+partial cardiomyocyte marker expression is carried forward as a specific
+point for further investigation in Day 4.
+
+---
+
+# 11. Session Info
+
+```{r session-info}
+sessionInfo()
+```
