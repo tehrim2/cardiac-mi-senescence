@@ -1,0 +1,474 @@
+---
+title: "Senescence Driven Cardiac Fibrosis After Myocardial Infarction, Target Discovery for Anti Fibrotic Gene Therapy"
+subtitle: "Day 4: Differential Expression, Pathway Enrichment, and Target Shortlisting"
+author: "Tehrim Naveed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
+```{r load-libraries}
+library(Seurat)
+library(tidyverse)
+library(DESeq2)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(clusterProfiler)
+library(httr)
+library(jsonlite)
+```
+
+# 1. Objective
+
+My Day 1 literature review identified a specific question as to how cardiac fibroblast senescence after myocardial infarction appears to be time dependent, transiently reparative in the days immediately following injury, but capable of becoming persistent and pathological if it does not resolve. Hernandez et al. (Scientific Data, 2026) name the early, beneficial state Reparative Cardiac Fibroblasts and explicitly note that the molecular switch point separating it from a persistent, pathological state is not yet defined. A companion bioRxiv study using a p16 senescence reporter mouse supports this framing directly, showing that senescent fibroblast burden after MI is dynamic and substantially reversible over time rather than fixed.
+
+In this notebook, I use the fibroblast population established and validated
+on Day 3, 39,256 nuclei with ambient RNA correction, marker verified cluster
+identity, and doublet cross validation, to directly compare fibroblasts with
+high versus low senescence signal and identify the genes that distinguish
+them. My goal is to shortlist evidence backed list of candidate genes for antifibrotic gene therapy, genes whose behavior could plausibly be modulated to favor the reparative state and limit the pathological one.
+
+---
+
+# 2. Defining Senescence Groups
+
+Both senescence scores computed on Day 3, AddModuleScore and AUCell, are
+continuous. To run a differential expression comparison I converted them into discrete high and low groups, using a consensus approach that requires both independently computed scores to agree, rather than relying on either method alone.
+
+```{r load-data}
+fibroblasts_final <- readRDS("data/processed/kuppe_fibroblasts_final_v2.rds")
+```
+
+I evaluated cutoffs at the top and bottom quartile and at the top and bottom
+third of each score's distribution. The quartile cutoff produced 7,588 High
+and 7,032 Low fibroblasts under the consensus requirement, a clean contrast
+but a comparatively small combined working set. The top and bottom third
+cutoff produced 10,284 High and 9,864 Low fibroblasts, a meaningfully larger
+set while still retaining agreement between both scoring methods, so I proceeded with it.
+
+```{r define-groups}
+aucell_high_cutoff <- quantile(fibroblasts_final@meta.data$SenMayo_AUCell, 0.67)
+aucell_low_cutoff <- quantile(fibroblasts_final@meta.data$SenMayo_AUCell, 0.33)
+addmod_high_cutoff <- quantile(fibroblasts_final@meta.data$SenMayo1, 0.67)
+addmod_low_cutoff <- quantile(fibroblasts_final@meta.data$SenMayo1, 0.33)
+
+fibroblasts_final@meta.data$senescence_group_33 <- "Mid"
+
+fibroblasts_final@meta.data$senescence_group_33[
+  fibroblasts_final@meta.data$SenMayo_AUCell >= aucell_high_cutoff &
+  fibroblasts_final@meta.data$SenMayo1 >= addmod_high_cutoff
+] <- "High"
+
+fibroblasts_final@meta.data$senescence_group_33[
+  fibroblasts_final@meta.data$SenMayo_AUCell <= aucell_low_cutoff &
+  fibroblasts_final@meta.data$SenMayo1 <= addmod_low_cutoff
+] <- "Low"
+
+table(fibroblasts_final@meta.data$senescence_group_33)
+```
+
+## 2.1 Patient Representation Check
+
+Before proceeding, I checked how evenly individual patients were represented
+across the High and Low groups, since an imbalance here could let one
+patient's individual biology be mistaken for a general senescence signature.
+
+```{r patient-balance-check}
+de_cells <- subset(fibroblasts_final, subset = senescence_group_33 %in% c("High", "Low"))
+cell_counts <- table(de_cells@meta.data$donor_id, de_cells@meta.data$senescence_group_33)
+cell_counts
+```
+
+All 20 patients were represented in both groups. One sample, P13's Low group
+at 23 cells, fell below a reasonable pseudobulk stability threshold. I chose
+to retain P13 given how isolated this single case was, rather than reduce my
+patient count, and treat this as a documented caveat to revisit as a
+sensitivity check if results appear to hinge on this one sample.
+
+---
+
+# 3. Pseudobulk Differential Expression
+
+I aggregated cells into one summed expression profile per patient per group
+rather than treating individual cells as independent replicates. This matters because patients, not cells, are the true independent unit of replication here, and cell counts per patient varied considerably, one patient (P15) contributed over 2,000 cells to the High group but only 69 to Low. Pseudobulk aggregation gives every patient equal statistical weight regardless of how many cells they contributed, directly addressing this imbalance.
+
+```{r pseudobulk-aggregate}
+pseudobulk <- AggregateExpression(
+  de_cells,
+  assays = "decontX",
+  group.by = c("donor_id", "senescence_group_33"),
+  return.seurat = FALSE
+)
+
+pseudobulk_counts <- pseudobulk$decontX
+dim(pseudobulk_counts)
+```
+
+I used the decontX corrected assay specifically, consistent with every
+analysis step since Day 3's ambient RNA correction.
+
+```{r deseq2-setup}
+sample_info <- data.frame(
+  sample = colnames(pseudobulk_counts),
+  donor_id = sub("_(High|Low)$", "", colnames(pseudobulk_counts)),
+  group = sub("^P[0-9]+_", "", colnames(pseudobulk_counts))
+)
+
+sample_info$group <- factor(sample_info$group, levels = c("Low", "High"))
+sample_info$donor_id <- factor(sample_info$donor_id)
+rownames(sample_info) <- sample_info$sample
+
+counts_rounded <- round(pseudobulk_counts)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_rounded,
+  colData = sample_info,
+  design = ~ donor_id + group
+)
+
+keep_genes <- rowSums(counts(dds)) >= 10
+dds <- dds[keep_genes, ]
+sum(keep_genes)
+```
+
+I used a paired design, `~ donor_id + group`, so that each patient's High
+and Low fibroblasts are compared against each other's own baseline before
+testing whether the group difference holds consistently across all 20
+patients. This removes person to person variation unrelated to senescence
+and is a more statistically powerful design than an unpaired comparison
+given this dataset's structure.
+
+```{r run-deseq2}
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("group", "High", "Low"))
+res <- res[order(res$padj), ]
+summary(res)
+```
+
+Of 22,555 genes with nonzero counts, 1,255 were significantly elevated and
+1,474 significantly reduced in High relative to Low fibroblasts, at
+adjusted p-value < 0.1. 
+
+```{r annotate-results}
+res_df <- as.data.frame(res)
+res_df$ensembl_id <- rownames(res_df)
+res_df$gene_symbol <- mapIds(org.Hs.eg.db, keys = res_df$ensembl_id, keytype = "ENSEMBL", column = "SYMBOL")
+```
+
+My top individual hits were CTNNB1, JUN, PAPPA, IGF1, IGFBP4, and IGFBP7, all elevated in the High group. Four of these six converge on IGF signaling, a pathway independently documented as part of the senescence associated
+secretory phenotype, an early and reassuring sign that this comparison is
+capturing real senescence biology rather than noise.
+
+---
+
+# 4. Pathway Enrichment
+
+I tested my significant gene list against MSigDB's Hallmark collection and
+against Reactome, to identify which coordinated biological processes are
+statistically over represented, rather than interpreting individual genes in
+isolation.
+
+```{r prepare-gene-list}
+sig_genes <- rownames(res)[!is.na(res$padj) & res$padj < 0.1]
+sig_symbols <- mapIds(org.Hs.eg.db, keys = sig_genes, keytype = "ENSEMBL", column = "SYMBOL")
+sig_symbols <- unique(na.omit(sig_symbols))
+length(sig_symbols)
+```
+
+```{r hallmark-enrichment}
+hallmark_sets <- msigdbr(species = "Homo sapiens", collection = "H")
+
+enrichment_results <- enricher(
+  gene = sig_symbols,
+  TERM2GENE = hallmark_sets[, c("gs_name", "gene_symbol")]
+)
+
+as.data.frame(enrichment_results) %>% arrange(p.adjust) %>% head(10)
+```
+
+TNFA_SIGNALING_VIA_NFKB and EPITHELIAL_MESENCHYMAL_TRANSITION were by far my
+strongest results, several orders of magnitude stronger than any other
+pathway tested. NF-kB is well established in the literature as the master
+transcriptional regulator of the SASP, so its emergence as my single
+strongest enriched pathway is an independent confirmation that my
+senescence scoring is capturing genuine SASP biology. EMT overlaps
+substantially with the fibroblast to myofibroblast activation process
+central to fibrosis, so together these two results describe senescent
+fibroblasts as inflammatory, NF-kB driven cells undergoing an activation
+process closely related to myofibroblast transition.
+
+I specifically tested whether Wnt/beta-catenin signaling was enriched given
+CTNNB1's position as my top individual hit.
+
+```{r wnt-check}
+all_hallmark_results <- enricher(
+  gene = sig_symbols,
+  TERM2GENE = hallmark_sets[, c("gs_name", "gene_symbol")],
+  pvalueCutoff = 1,
+  qvalueCutoff = 1
+)
+
+as.data.frame(all_hallmark_results) %>% filter(ID == "HALLMARK_WNT_BETA_CATENIN_SIGNALING")
+```
+
+Wnt/beta-catenin signaling as a coordinated pathway was not enriched
+(p = 0.28, fold enrichment 1.25, close to the baseline of no enrichment).
+CTNNB1 remains a genuine, strong individual hit, appearing across three
+other significant pathways rather than acting in isolation.
+
+```{r reactome-enrichment}
+reactome_sets <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+
+reactome_results <- enricher(
+  gene = sig_symbols,
+  TERM2GENE = reactome_sets[, c("gs_name", "gene_symbol")]
+)
+
+as.data.frame(reactome_results) %>% arrange(p.adjust) %>% head(10)
+
+write.csv(
+  as.data.frame(reactome_results) %>% arrange(p.adjust),
+  "results/tables/reactome_enrichment_full.csv",
+  row.names = FALSE
+)
+```
+
+Reactome's finer granularity resolved two pathways that Hallmark's broader
+categories only showed as scattered individual genes. EXTRACELLULAR_MATRIX_
+ORGANIZATION was my single strongest Reactome result, directly relevant given this is the molecular machinery of fibrosis itself. SIGNALING_BY_VEGF and the dedicated IGF transport and uptake pathway were both independently
+significant, confirming VEGFA/VEGFC and the IGF/IGFBP axis observed among my
+top individual hits are genuine, coordinated pathway level signals rather
+than isolated genes.
+
+---
+
+# 5. Candidate Gene Shortlisting
+
+I combined statistical strength with pathway convergence, counting how many
+of five independently confirmed significant pathways (ECM organization, VEGF
+signaling, IGF regulation, NF-kB signaling, EMT) each candidate gene belongs
+to.
+
+```{r build-candidate-table}
+ecm_genes <- strsplit(as.data.frame(reactome_results)["REACTOME_EXTRACELLULAR_MATRIX_ORGANIZATION", "geneID"], "/")[[1]]
+vegf_genes <- strsplit(as.data.frame(reactome_results)["REACTOME_SIGNALING_BY_VEGF", "geneID"], "/")[[1]]
+igf_genes <- strsplit(as.data.frame(reactome_results)["REACTOME_REGULATION_OF_INSULIN_LIKE_GROWTH_FACTOR_IGF_TRANSPORT_AND_UPTAKE_BY_INSULIN_LIKE_GROWTH_FACTOR_BINDING_PROTEINS_IGFBPS", "geneID"], "/")[[1]]
+nfkb_genes <- strsplit(as.data.frame(enrichment_results)["HALLMARK_TNFA_SIGNALING_VIA_NFKB", "geneID"], "/")[[1]]
+emt_genes <- strsplit(as.data.frame(enrichment_results)["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", "geneID"], "/")[[1]]
+
+candidates <- res_df %>%
+  filter(!is.na(padj), padj < 0.01, abs(log2FoldChange) > 0.5) %>%
+  arrange(padj)
+
+candidates$in_ECM <- candidates$gene_symbol %in% ecm_genes
+candidates$in_VEGF <- candidates$gene_symbol %in% vegf_genes
+candidates$in_IGF <- candidates$gene_symbol %in% igf_genes
+candidates$in_NFKB <- candidates$gene_symbol %in% nfkb_genes
+candidates$in_EMT <- candidates$gene_symbol %in% emt_genes
+candidates$pathway_count <- rowSums(candidates[, c("in_ECM", "in_VEGF", "in_IGF", "in_NFKB", "in_EMT")])
+
+candidates <- candidates %>%
+  select(gene_symbol, ensembl_id, everything()) %>%
+  arrange(desc(pathway_count), padj)
+
+rownames(candidates) <- NULL
+write.csv(candidates, "results/tables/candidate_genes_full.csv", row.names = FALSE)
+```
+
+One gene in this ranked list, CCN1, connects directly to prior literature.
+A 2024 Cell Death Discovery review on cardiac cell senescence reports that
+CCN1, a SASP protein, ameliorates myocardial fibrosis, possibly by inducing
+fibroblast senescence after MI. CCN1 independently emerged in my own top
+tier with a pathway count of 3, statistically significant (padj = 3.6e-13)
+and elevated in High senescence fibroblasts, which is consistent with this
+published mechanism, and strengthens confidence that my scoring and comparison are recovering biologically real signal.
+
+I took the top 15 genes by this ranking as an established, data driven
+shortlist, and separately added ACVR1B and AXL, two genes that were
+individually significant but showed no dedicated pathway enrichment in my
+five tested pathways and comparatively limited representation in prior
+senescence specific literature, as a deliberate exploratory addition.
+
+```{r shortlist}
+shortlist <- candidates %>%
+  filter(pathway_count >= 2) %>%
+  arrange(desc(pathway_count), padj) %>%
+  head(15)
+
+novel_additions <- res_df %>% filter(gene_symbol %in% c("ACVR1B", "AXL"))
+
+working_list <- bind_rows(shortlist, novel_additions) %>%
+  distinct(gene_symbol, .keep_all = TRUE)
+```
+
+---
+
+# 6. Druggability and Therapeutic Evidence
+
+I queried the Open Targets Platform for clinical stage drug and candidate
+evidence, and DGIdb for broader drug-gene interaction evidence, for each of
+my 17 shortlisted genes, to separate established, clinically validated
+targets from genuinely novel candidates with no current therapeutic
+development.
+
+```{r opentargets-query}
+final_query <- '
+query($ensemblId: String!) {
+  target(ensemblId: $ensemblId) {
+    approvedSymbol
+    drugAndClinicalCandidates {
+      count
+      rows {
+        maxClinicalStage
+        drug {
+          name
+        }
+      }
+    }
+  }
+}'
+
+get_open_targets_drugs <- function(ensembl_id, symbol) {
+  response <- POST(
+    url = "https://api.platform.opentargets.org/api/v4/graphql",
+    body = toJSON(list(query = final_query, variables = list(ensemblId = ensembl_id)), auto_unbox = TRUE),
+    encode = "json",
+    add_headers("Content-Type" = "application/json")
+  )
+  result <- content(response, as = "parsed")
+  count <- result$data$target$drugAndClinicalCandidates$count
+  if (is.null(count) || count == 0) {
+    return(data.frame(gene_symbol = symbol, ensembl_id = ensembl_id, drug_count = 0, top_drug = NA, max_phase = NA))
+  }
+  top_row <- result$data$target$drugAndClinicalCandidates$rows[[1]]
+  data.frame(gene_symbol = symbol, ensembl_id = ensembl_id, drug_count = count, top_drug = top_row$drug$name, max_phase = top_row$maxClinicalStage)
+}
+
+opentargets_results <- list()
+for (i in 1:nrow(working_list)) {
+  opentargets_results[[i]] <- get_open_targets_drugs(working_list$ensembl_id[i], working_list$gene_symbol[i])
+  Sys.sleep(0.5)
+}
+opentargets_df <- bind_rows(opentargets_results)
+```
+
+Open Targets' `drugAndClinicalCandidates` field specifically tracks drugs
+that have entered real clinical development, a narrower and more
+therapeutically meaningful measure than a general interaction database.
+
+```{r dgidb-query}
+get_dgidb_drugs <- function(symbol) {
+  query <- '
+  query($names: [String!]) {
+    genes(names: $names) {
+      nodes {
+        name
+        interactions {
+          drug { name }
+          interactionScore
+        }
+      }
+    }
+  }'
+  response <- POST(
+    url = "https://dgidb.org/api/graphql",
+    body = toJSON(list(query = query, variables = list(names = list(symbol))), auto_unbox = TRUE),
+    encode = "json",
+    add_headers("Content-Type" = "application/json")
+  )
+  result <- content(response, as = "parsed")
+  nodes <- result$data$genes$nodes
+  if (length(nodes) == 0 || length(nodes[[1]]$interactions) == 0) {
+    return(data.frame(gene_symbol = symbol, dgidb_drug_count = 0, top_dgidb_drug = NA))
+  }
+  interactions <- nodes[[1]]$interactions
+  top_interaction <- interactions[[which.max(sapply(interactions, function(x) {
+    score <- x$interactionScore
+    if (is.null(score)) -Inf else score
+  }))]]
+  data.frame(gene_symbol = symbol, dgidb_drug_count = length(interactions), top_dgidb_drug = top_interaction$drug$name)
+}
+
+dgidb_results <- list()
+for (i in 1:nrow(working_list)) {
+  dgidb_results[[i]] <- get_dgidb_drugs(working_list$gene_symbol[i])
+  Sys.sleep(0.5)
+}
+dgidb_df <- bind_rows(dgidb_results)
+```
+
+DGIdb draws from a much broader set of sources, including preclinical
+research reagents, and does not require any clinical development stage. I therefore used DGIdb's count only as a secondary, general
+indicator of research attention, and used Open Targets' `drug_count` and
+`max_phase` specifically to define my established versus exploratory tiers,
+since that field is curated for clinical relevance.
+
+```{r final-table}
+final_candidates <- working_list %>%
+  left_join(opentargets_df, by = c("gene_symbol", "ensembl_id")) %>%
+  left_join(dgidb_df, by = "gene_symbol") %>%
+  select(gene_symbol, log2FoldChange, padj, drug_count, max_phase, dgidb_drug_count)
+
+final_candidates$in_ECM <- final_candidates$gene_symbol %in% ecm_genes
+final_candidates$in_VEGF <- final_candidates$gene_symbol %in% vegf_genes
+final_candidates$in_IGF <- final_candidates$gene_symbol %in% igf_genes
+final_candidates$in_NFKB <- final_candidates$gene_symbol %in% nfkb_genes
+final_candidates$in_EMT <- final_candidates$gene_symbol %in% emt_genes
+final_candidates$pathway_count <- rowSums(final_candidates[, c("in_ECM", "in_VEGF", "in_IGF", "in_NFKB", "in_EMT")])
+
+final_candidates$tier <- ifelse(
+  final_candidates$drug_count > 0 & !is.na(final_candidates$drug_count),
+  "Established (clinical-stage evidence)",
+  "Exploratory (no clinical-stage evidence)"
+)
+
+write.csv(final_candidates, "results/tables/final_candidate_genes.csv", row.names = FALSE)
+
+final_candidates[, c("gene_symbol", "pathway_count", "drug_count", "max_phase", "tier")]
+```
+
+This produced 7 established candidates with real clinical stage evidence
+(TNC, MMP2, VEGFA, SERPINE1, CD44, FN1, IL6, VEGFC, ICAM1, AXL) and 6
+exploratory candidates with strong statistical and pathway support but no
+current drug development (CCN1, JUN, IGFBP4, GEM, PLAUR, THBS1, ACVR1B).
+TNC in particular already has a Phase 3 antibody candidate (Tenatumomab),
+and given its role in the ECM organization pathway, its convergence across 4
+of my 5 tested pathways, and prior cardiac tissue remodeling literature, it
+is my strongest single established candidate.
+
+---
+
+# 7. Summary
+
+Comparing high and low senescence cardiac fibroblasts, defined by consensus
+agreement between two independent scoring methods across 20 matched
+patients, identified 2,729 significantly different genes. Pathway
+enrichment converged on NF-kB driven SASP signaling, EMT associated
+fibroblast activation, extracellular matrix organization, and a coordinated
+VEGF and IGF signaling axis, consistent with established senescence and
+fibrosis biology and with at least one direct precedent in the literature
+(CCN1). From this evidence I produced a 17 gene, two tier candidate list for
+anti-fibrotic gene therapy: 7 established genes with existing clinical stage
+development, and 6 exploratory genes with strong statistical and pathway
+support but no current therapeutic development. This analysis is
+deliberately scoped to the fibroblast lineage specifically, given its direct
+mechanistic role in fibrosis, with cross-cell-type signaling identified as a
+next step.
+
+---
+
+# 8. Session Info
+
+```{r session-info}
+sessionInfo()
+```
