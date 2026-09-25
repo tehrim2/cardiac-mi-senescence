@@ -127,6 +127,4 @@ populations and senescent fibroblasts, via cell-cell communication analysis, is
 a natural next step for the project.
 Ambient RNA correction was performed using DecontX rather than SoupX or
 CellBender, since the raw, unfiltered droplet matrices required by those
-tools were not available through this dataset's public distribution. One
-patient sample (P13) contributed a comparatively thin cell count to its low
-senescence group and is documented as a caveat rather than excluded.
+tools were not available through this dataset's public distribution.
